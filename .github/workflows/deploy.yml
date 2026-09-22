@@ -199,7 +199,7 @@ jobs:
             POSTGRES_DB=$POSTGRES_DB
             POSTGRES_USER=$POSTGRES_USER
             POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-            DB_HOST=postgres
+            DB_HOST=db
             DB_PORT=5432
             SECRET_KEY=$DJANGO_SECRET_KEY
             DEBUG=False
@@ -208,7 +208,7 @@ jobs:
             echo "$DOCKER_PASSWORD" | sudo docker login \
               --username "$DOCKER_USERNAME" --password-stdin
             sudo docker compose -f docker-compose.production.yml pull
-            sudo docker compose -f docker-compose.production.yml up -d postgres
+            sudo docker compose -f docker-compose.production.yml up -d db
             sudo docker compose -f docker-compose.production.yml run --rm frontend
             sudo docker compose -f docker-compose.production.yml up -d backend
             sudo docker compose -f docker-compose.production.yml exec -T backend \

@@ -1,24 +1,76 @@
-#  Как работать с репозиторием финального задания
+# Kittygram infrastructure
 
-## Что нужно сделать
+Terraform creates the Kittygram infrastructure in Yandex Cloud:
 
-Настроить запуск проекта Kittygram в контейнерах и CI/CD с помощью GitHub Actions
+- VPC network and subnet;
+- static public IP;
+- security group with inbound ports `22` and `9000`;
+- Ubuntu 24.04 VM prepared by cloud-init;
+- Object Storage bucket for Terraform state.
 
-## Как проверить работу с помощью автотестов
+The application is built and deployed by GitHub Actions.
 
-В корне репозитория создайте файл tests.yml со следующим содержимым:
-```yaml
-repo_owner: ваш_логин_на_гитхабе
-kittygram_domain: полная ссылка (http://<ip-адрес вашей ВМ>:<порт gateway>) на ваш проект Kittygram
-dockerhub_username: ваш_логин_на_докерхабе
+## State bucket
+
+Authenticate `yc` in the required organization and create the state bucket:
+
+```bash
+export YC_TOKEN=$(yc iam create-token)
+terraform -chdir=infra/bootstrap init
+terraform -chdir=infra/bootstrap apply \
+  -var="bucket_name=kittygram-tfstate-itmp9"
 ```
 
-Скопируйте содержимое файла `.github/workflows/main.yml` в файл `kittygram_workflow.yml` в корневой директории проекта.
+The bootstrap state contains credentials and must stay local. Get values for
+GitHub secrets:
 
-Для локального запуска тестов создайте виртуальное окружение, установите в него зависимости из backend/requirements.txt и запустите в корневой директории проекта `pytest`.
+```bash
+terraform -chdir=infra/bootstrap output -raw bucket_name
+terraform -chdir=infra/bootstrap output -raw access_key
+terraform -chdir=infra/bootstrap output -raw secret_key
+terraform -chdir=infra/bootstrap output -raw authorized_key
+```
 
-## Чек-лист для проверки перед отправкой задания
+## GitHub secrets
 
-- Проект Kittygram доступен по ссылке, указанной в `tests.yml`.
-- Пуш в ветку main запускает тестирование и деплой Kittygram, а после успешного деплоя вам приходит сообщение в телеграм.
-- В корне проекта есть файл `kittygram_workflow.yml`.
+Infrastructure:
+
+| Secret | Value |
+| --- | --- |
+| `TF_STATE_BUCKET` | `bucket_name` output |
+| `ACCESS_KEY` | `access_key` output |
+| `SECRET_KEY` | `secret_key` output |
+| `YC_SERVICE_ACCOUNT_KEY` | `authorized_key` output |
+| `SSH_PUBLIC_KEY` | Public SSH key used by cloud-init |
+| `SSH_KEY` | Matching private SSH key |
+
+Application:
+
+| Secret | Value |
+| --- | --- |
+| `DOCKER_USERNAME` | Docker Hub username |
+| `DOCKER_PASSWORD` | Docker Hub token |
+| `POSTGRES_DB` | PostgreSQL database name |
+| `POSTGRES_USER` | PostgreSQL username |
+| `POSTGRES_PASSWORD` | PostgreSQL password |
+| `DJANGO_SECRET_KEY` | Django secret key |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID |
+| `TELEGRAM_TOKEN` | Telegram bot token |
+
+## Deploy
+
+Run the `Terraform` workflow with the `apply` action. Its summary contains the
+VM IP and the application URL.
+
+Replace the temporary address in `tests.yml` with that URL:
+
+```yaml
+kittygram_domain: http://<vm-ip>:9000
+```
+
+Push to `main`. The `Kittygram Deploy` workflow checks the backend and
+frontend, publishes three Docker images, deploys the application, runs the
+external tests, and sends the Telegram notification.
+
+Use the `destroy` action in the `Terraform` workflow to remove the main
+infrastructure. The state bucket is managed separately in `infra/bootstrap`.

@@ -155,7 +155,7 @@ jobs:
       - infrastructure
     steps:
       - name: Test VM connectivity
-        run: nc -vz -w 10 51.250.69.50 22
+        run: nc -vz -w 10 84.201.159.79 22
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Copy Compose file

@@ -154,6 +154,8 @@ jobs:
       - build_and_push
       - infrastructure
     steps:
+      - name: Test VM connectivity
+        run: nc -vz -w 10 51.250.69.50 22
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Copy Compose file

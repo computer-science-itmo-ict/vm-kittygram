@@ -156,7 +156,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+      - name: Test SSH port
+        run: nc -vz -w 10 ${{ needs.infrastructure.outputs.host }} 22
       - name: Copy Compose file
         uses: appleboy/scp-action@v1
         with:

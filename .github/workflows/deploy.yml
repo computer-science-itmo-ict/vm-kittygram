@@ -1,0 +1,275 @@
+name: Kittygram Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  backend_lint:
+    name: Check backend code style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: flake8 backend --exclude="*/migrations/*"
+
+  tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt requests
+
+      - name: Run backend tests
+        run: pytest tests/test_files.py
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: ./frontend
+        run: npm test -- --watchAll=false --coverage=false
+
+  infrastructure:
+    name: Read infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      host: ${{ steps.terraform.outputs.host }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SECRET_KEY }}
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+
+      - name: Configure Terraform provider mirror
+        run: |
+          cat > "$RUNNER_TEMP/terraformrc" <<'EOF'
+          provider_installation {
+            network_mirror {
+              url     = "https://terraform-mirror.yandexcloud.net/"
+              include = ["registry.terraform.io/yandex-cloud/yandex"]
+            }
+            direct {
+              exclude = ["registry.terraform.io/yandex-cloud/yandex"]
+            }
+          }
+          EOF
+          echo "TF_CLI_CONFIG_FILE=$RUNNER_TEMP/terraformrc" >> "$GITHUB_ENV"
+
+      - name: Read VM address
+        id: terraform
+        working-directory: ./infra
+        run: |
+          terraform init -reconfigure -backend-config="bucket=$TF_STATE_BUCKET"
+          echo "host=$(terraform output -raw vm_external_ip)" >> "$GITHUB_OUTPUT"
+
+  build_and_push:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    needs:
+      - backend_lint
+      - tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_backend:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/kittygram_backend:latest
+          cache-to: type=inline
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_frontend:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/kittygram_frontend:latest
+          cache-to: type=inline
+
+      - name: Build and push gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nginx
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/kittygram_gateway:latest
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/kittygram_gateway:latest
+          cache-to: type=inline
+
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+    needs:
+      - build_and_push
+      - infrastructure
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy Compose file
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ needs.infrastructure.outputs.host }}
+          username: kittygram
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.production.yml
+          target: /home/kittygram/kittygram
+
+      - name: Deploy application
+        uses: appleboy/ssh-action@v1
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          HOST: ${{ needs.infrastructure.outputs.host }}
+        with:
+          host: ${{ needs.infrastructure.outputs.host }}
+          username: kittygram
+          key: ${{ secrets.SSH_KEY }}
+          envs: DOCKER_USERNAME,DOCKER_PASSWORD,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,DJANGO_SECRET_KEY,HOST
+          command_timeout: 20m
+          script: |
+            set -e
+            cd /home/kittygram/kittygram
+            for attempt in $(seq 1 60); do
+              if command -v docker >/dev/null && sudo docker info >/dev/null 2>&1; then
+                break
+              fi
+              sleep 10
+            done
+            sudo docker info >/dev/null
+            cat > .env <<EOF
+            DOCKER_USERNAME=$DOCKER_USERNAME
+            GATEWAY_PORT=9000
+            POSTGRES_DB=$POSTGRES_DB
+            POSTGRES_USER=$POSTGRES_USER
+            POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+            DB_HOST=postgres
+            DB_PORT=5432
+            SECRET_KEY=$DJANGO_SECRET_KEY
+            DEBUG=False
+            ALLOWED_HOSTS=$HOST
+            EOF
+            echo "$DOCKER_PASSWORD" | sudo docker login \
+              --username "$DOCKER_USERNAME" --password-stdin
+            sudo docker compose -f docker-compose.production.yml pull
+            sudo docker compose -f docker-compose.production.yml up -d postgres
+            sudo docker compose -f docker-compose.production.yml run --rm frontend
+            sudo docker compose -f docker-compose.production.yml up -d backend
+            sudo docker compose -f docker-compose.production.yml exec -T backend \
+              python manage.py migrate
+            sudo docker compose -f docker-compose.production.yml exec -T backend \
+              python manage.py collectstatic --no-input
+            sudo docker compose -f docker-compose.production.yml up -d gateway
+            sudo docker image prune -f
+
+  auto_tests:
+    name: Run tests after deploy
+    runs-on: ubuntu-latest
+    needs:
+      - deploy
+      - infrastructure
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Install test dependencies
+        run: pip install -r backend/requirements.txt requests
+
+      - name: Prepare deploy settings
+        env:
+          HOST: ${{ needs.infrastructure.outputs.host }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          cat > tests.yml <<EOF
+          repo_owner: ${{ github.repository_owner }}
+          kittygram_domain: http://$HOST:9000
+          dockerhub_username: $DOCKER_USERNAME
+          EOF
+
+      - name: Run auto tests
+        run: pytest
+
+  telegram_notify:
+    name: Send Telegram notification
+    runs-on: ubuntu-latest
+    needs:
+      - auto_tests
+      - infrastructure
+    env:
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+    steps:
+      - name: Send Telegram notification
+        if: ${{ env.TELEGRAM_CHAT_ID != '' && env.TELEGRAM_TOKEN != '' }}
+        env:
+          MESSAGE: |
+            Kittygram deploy completed.
+            Author: ${{ github.actor }}
+            Commit: ${{ github.event.head_commit.message }}
+            URL: http://${{ needs.infrastructure.outputs.host }}:9000
+        run: |
+          curl --fail --silent --show-error \
+            --request POST \
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
+            --data-urlencode "text=$MESSAGE" \
+            "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage"

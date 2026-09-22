@@ -209,6 +209,7 @@ jobs:
               --username "$DOCKER_USERNAME" --password-stdin
             sudo docker compose -f docker-compose.production.yml pull
             sudo docker compose -f docker-compose.production.yml up -d db
+            sleep 15
             sudo docker compose -f docker-compose.production.yml run --rm frontend
             sudo docker compose -f docker-compose.production.yml up -d backend
             sudo docker compose -f docker-compose.production.yml exec -T backend \
